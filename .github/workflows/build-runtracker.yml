@@ -23,3 +23,9 @@ jobs:
         with:
           name: RunTracker-v0.1.0-unsigned
           path: app/build/outputs/apk/release/app-release-unsigned.apk
+      - name: Prepare Android APK signer
+        run: cp "$(find "$ANDROID_HOME/build-tools" -path '*/lib/apksigner.jar' | sort | tail -1)" apksigner.jar
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-apksigner-tool
+          path: apksigner.jar
