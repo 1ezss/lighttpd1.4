@@ -251,9 +251,9 @@ public class MainActivity extends Activity implements SensorEventListener {
         }
         root.addView(avatars);
 
-        EditText weight = numberField(tr("Weight (kg)", "Poids (kg)", "משקל (ק"ג)"), prefs.getFloat("weight", 70f));
-        EditText height = numberField(tr("Height (cm)", "Taille (cm)", "גובה (ס"מ)"), prefs.getFloat("height", 175f));
-        EditText target = numberField(tr("Target weight (kg)", "Poids cible (kg)", "משקל יעד (ק"ג)"), prefs.getFloat("target_weight", 70f));
+        EditText weight = numberField(tr("Weight (kg)", "Poids (kg)", "משקל בקג"), prefs.getFloat("weight", 70f));
+        EditText height = numberField(tr("Height (cm)", "Taille (cm)", "גובה בסמ"), prefs.getFloat("height", 175f));
+        EditText target = numberField(tr("Target weight (kg)", "Poids cible (kg)", "משקל יעד בקג"), prefs.getFloat("target_weight", 70f));
         root.addView(weight); root.addView(height); root.addView(target);
 
         Button logs = sportyButton(tr("DEBUG / LOGS", "DEBUG / LOGS", "DEBUG / LOGS"));
@@ -552,7 +552,7 @@ public class MainActivity extends Activity implements SensorEventListener {
         if (pts != null && pts.length() > 1) {
             root.addView(label(tr("Elevation profile", "Profil d'altitude", "גרף טיפוס")));
             root.addView(new RunChartView(this, pts, true), new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(180)));
-            root.addView(label(tr("Pace by kilometer", "Allure par kilomètre", "קצב לכל ק"מ")));
+            root.addView(label(tr("Pace by kilometer", "Allure par kilomètre", "קצב לכל קמ")));
             root.addView(new RunChartView(this, pts, false), new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(180)));
         }
 
