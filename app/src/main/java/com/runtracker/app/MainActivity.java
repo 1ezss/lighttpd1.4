@@ -26,7 +26,7 @@ import java.text.SimpleDateFormat;
 import java.util.*;
 
 /**
- * RunTracker v0.1.0
+ * RunTracker v0.1.1
  * Single-activity first working build. The code is intentionally explicit and heavily named
  * so it can later be split into ViewModel / repository / persistence modules without ambiguity.
  */
@@ -61,6 +61,7 @@ public class MainActivity extends Activity implements SensorEventListener {
     private WeatherSnapshot weather = new WeatherSnapshot();
     private String pendingRunPhotoUri = "";
     private JSONObject currentSummaryRun;
+    private double currentSmoothedSpeedMps = 0.0;
 
     private final Runnable timerRunnable = new Runnable() {
         @Override public void run() {
@@ -302,7 +303,7 @@ public class MainActivity extends Activity implements SensorEventListener {
         running = true; paused = false;
         startEpochMs = System.currentTimeMillis(); totalPausedMs = 0; pauseStartedMs = 0;
         initialStepCounter = -1; currentSteps = 0; totalDistanceMeters = 0; totalCalories = 0;
-        previousLocation = null; route.clear(); weather = new WeatherSnapshot();
+        previousLocation = null; route.clear(); weather = new WeatherSnapshot(); currentSmoothedSpeedMps = 0.0;
         startButton.setEnabled(false); pauseButton.setEnabled(true); finishButton.setEnabled(true);
         log("Run started at " + startEpochMs);
         if (prefs.getBoolean("gps", true)) startLocationUpdates();
@@ -377,6 +378,7 @@ public class MainActivity extends Activity implements SensorEventListener {
             }
         }
         previousLocation = loc;
+        currentSmoothedSpeedMps = calculateSmoothedCurrentSpeed();
         updateLiveMetrics();
     }
 
@@ -446,10 +448,38 @@ public class MainActivity extends Activity implements SensorEventListener {
         distanceValue.setText(String.format(Locale.US, "%.2f %s", dist, miles ? "mi" : "km"));
         double avgSpeedMps = elapsed > 0 ? totalDistanceMeters / (elapsed / 1000.0) : 0;
         avgPaceValue.setText(formatPaceOrSpeed(avgSpeedMps, miles));
-        double currentSpeed = route.isEmpty() ? 0 : route.get(route.size()-1).speedMps;
-        currentPaceValue.setText(formatPaceOrSpeed(currentSpeed, miles));
+        currentPaceValue.setText(formatPaceOrSpeed(currentSmoothedSpeedMps, miles));
         stepsValue.setText(String.valueOf(currentSteps));
         caloriesValue.setText(String.format(Locale.US, "%.0f kcal", totalCalories));
+    }
+
+    /**
+     * Current pace is intentionally NOT based on the last raw GPS speed sample.
+     * It is calculated from a rolling GPS window so temporary satellite jitter does not
+     * produce impossible pace values while the runner is moving steadily.
+     */
+    private double calculateSmoothedCurrentSpeed() {
+        if (route.size() < 2) return 0.0;
+        int last = route.size() - 1;
+        RoutePoint newest = route.get(last);
+        long targetWindowMs = 10_000L;
+        int first = last - 1;
+        while (first > 0 && newest.timeMs - route.get(first).timeMs < targetWindowMs) first--;
+        RoutePoint oldest = route.get(first);
+        long dt = newest.timeMs - oldest.timeMs;
+        if (dt < 3_000L) return 0.0;
+
+        double distance = 0.0;
+        float[] out = new float[1];
+        for (int i = first + 1; i <= last; i++) {
+            RoutePoint a = route.get(i - 1);
+            RoutePoint b = route.get(i);
+            Location.distanceBetween(a.lat, a.lon, b.lat, b.lon, out);
+            if (out[0] > 0.5f && out[0] < 120f) distance += out[0];
+        }
+        double speed = distance / (dt / 1000.0);
+        if (speed < 0.45) return 0.0;
+        return Math.min(speed, 12.0);
     }
 
     private long activeElapsedMs() {
@@ -525,9 +555,23 @@ public class MainActivity extends Activity implements SensorEventListener {
 
         JSONArray pts = run.optJSONArray("route");
         if (pts != null && pts.length() > 0) {
+            logGoogleMapsDiagnostic("summary-open");
             MapView map = new MapView(this); map.onCreate(null); map.onResume();
             root.addView(map, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(300)));
-            map.getMapAsync(gm -> drawRoute(gm, pts));
+            try {
+                MapsInitializer.initialize(getApplicationContext(), MapsInitializer.Renderer.LATEST,
+                    renderer -> log("Google Maps renderer initialized: " + renderer));
+            } catch (Exception e) {
+                log("Google Maps initialization error: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+            }
+            map.getMapAsync(gm -> {
+                log("Google Maps onMapReady received");
+                gm.setOnMapLoadedCallback(() -> log("Google Maps tiles loaded successfully"));
+                drawRoute(gm, pts);
+                new Handler(Looper.getMainLooper()).postDelayed(() ->
+                    log("Google Maps diagnostic timeout check completed - if no 'tiles loaded successfully' line appears above, check API key restrictions / SHA-1 / Maps SDK for Android"),
+                    8000);
+            });
         }
         root.addView(summaryLine(tr("Distance", "Distance", "מרחק"), String.format(Locale.US, "%.2f km", run.optDouble("distance_m")/1000.0)));
         root.addView(summaryLine(tr("Time", "Temps", "זמן"), formatDuration(run.optLong("duration_ms"))));
@@ -551,9 +595,9 @@ public class MainActivity extends Activity implements SensorEventListener {
 
         if (pts != null && pts.length() > 1) {
             root.addView(label(tr("Elevation profile", "Profil d'altitude", "גרף טיפוס")));
-            root.addView(new RunChartView(this, pts, true), new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(180)));
-            root.addView(label(tr("Pace by kilometer", "Allure par kilomètre", "קצב לכל קמ")));
-            root.addView(new RunChartView(this, pts, false), new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(180)));
+            root.addView(new RunChartView(this, pts, true, prefs.getInt("distance_unit", 0) == 1), new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(230)));
+            root.addView(label(tr("Pace by distance", "Allure par distance", "קצב לפי מרחק")));
+            root.addView(new RunChartView(this, pts, false, prefs.getInt("distance_unit", 0) == 1), new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(230)));
         }
 
         Button save = sportyButton(tr("SAVE SUMMARY", "ENREGISTRER", "שמור סיכום"));
@@ -569,6 +613,60 @@ public class MainActivity extends Activity implements SensorEventListener {
 
     private TextView summaryLine(String a, String b) { TextView t=label(a + ":  " + b); t.setTextSize(18); t.setTypeface(Typeface.create("sans-serif-medium",Typeface.NORMAL)); return t; }
     private RatingBar rating(int value) { RatingBar r = new RatingBar(this, null, android.R.attr.ratingBarStyle); r.setNumStars(5); r.setStepSize(1); r.setRating(value); return r; }
+
+    private void logGoogleMapsDiagnostic(String stage) {
+        try {
+            String packageName = getPackageName();
+            String version = getVersionName();
+            String key = getString(com.runtracker.app.R.string.google_maps_key);
+            String keySummary = key == null ? "null" : (key.length() >= 10 ? key.substring(0, 6) + "..." + key.substring(key.length()-4) : "too-short");
+            String sha1 = runtimeSigningSha1();
+            boolean network = false;
+            try {
+                android.net.ConnectivityManager cm = (android.net.ConnectivityManager)getSystemService(CONNECTIVITY_SERVICE);
+                android.net.Network n = cm.getActiveNetwork();
+                android.net.NetworkCapabilities caps = n == null ? null : cm.getNetworkCapabilities(n);
+                network = caps != null && caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET);
+            } catch (Exception ignored) {}
+            log("Google Maps diagnostic [" + stage + "]: package=" + packageName
+                + ", version=" + version + ", signingSHA1=" + sha1
+                + ", key=" + keySummary + ", keyLength=" + (key == null ? 0 : key.length())
+                + ", internet=" + network);
+        } catch (Exception e) {
+            log("Google Maps diagnostic failed: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+        }
+    }
+
+    private String runtimeSigningSha1() {
+        try {
+            android.content.pm.PackageInfo info;
+            if (Build.VERSION.SDK_INT >= 28) {
+                info = getPackageManager().getPackageInfo(getPackageName(), PackageManager.GET_SIGNING_CERTIFICATES);
+                android.content.pm.Signature[] sigs = info.signingInfo.getApkContentsSigners();
+                if (sigs == null || sigs.length == 0) return "none";
+                java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-1");
+                byte[] digest = md.digest(sigs[0].toByteArray());
+                StringBuilder sb = new StringBuilder();
+                for (int i=0;i<digest.length;i++) {
+                    if (i>0) sb.append(":");
+                    sb.append(String.format(Locale.US, "%02X", digest[i] & 0xff));
+                }
+                return sb.toString();
+            } else {
+                info = getPackageManager().getPackageInfo(getPackageName(), PackageManager.GET_SIGNATURES);
+                java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-1");
+                byte[] digest = md.digest(info.signatures[0].toByteArray());
+                StringBuilder sb = new StringBuilder();
+                for (int i=0;i<digest.length;i++) {
+                    if (i>0) sb.append(":");
+                    sb.append(String.format(Locale.US, "%02X", digest[i] & 0xff));
+                }
+                return sb.toString();
+            }
+        } catch (Exception e) {
+            return "error:" + e.getClass().getSimpleName();
+        }
+    }
 
     private void drawRoute(GoogleMap gm, JSONArray pts) {
         try {
@@ -613,7 +711,7 @@ public class MainActivity extends Activity implements SensorEventListener {
 
     private String tr(String en, String fr, String he) { int l=prefs.getInt("language",0); return l==1?fr:(l==2?he:en); }
     private String formatDate(long epoch) { return new SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault()).format(new Date(epoch)); }
-    private String getVersionName() { try { return getPackageManager().getPackageInfo(getPackageName(),0).versionName; } catch(Exception e){return "0.1.0";} }
+    private String getVersionName() { try { return getPackageManager().getPackageInfo(getPackageName(),0).versionName; } catch(Exception e){return "0.1.1";} }
     private int dp(int v) { return (int)(v*getResources().getDisplayMetrics().density+0.5f); }
 
     static class RoutePoint {
@@ -623,14 +721,140 @@ public class MainActivity extends Activity implements SensorEventListener {
     }
     static class WeatherSnapshot { boolean valid=false; double temperatureC=Double.NaN,humidity=Double.NaN,windSpeedMs=0,windDirectionDeg=0; }
 
-    /** Simple custom chart: elevation or approximate pace samples. */
+    /**
+     * Distance-based chart used by the run summary.
+     * Elevation mode: X = distance, Y = altitude.
+     * Pace mode: X = distance, Y = rolling pace computed from route geometry and time.
+     * Both modes render grid lines, numeric ticks and units so the graph is self-explanatory.
+     */
     static class RunChartView extends View {
-        final JSONArray points; final boolean elevation; final Paint p=new Paint(Paint.ANTI_ALIAS_FLAG);
-        RunChartView(Context c, JSONArray pts, boolean elevation){super(c);this.points=pts;this.elevation=elevation;p.setStrokeWidth(5f);p.setStyle(Paint.Style.STROKE);p.setColor(Color.BLACK);setBackgroundColor(Color.rgb(245,245,245));}
-        @Override protected void onDraw(Canvas c){super.onDraw(c); if(points.length()<2)return; ArrayList<Double> vals=new ArrayList<>();
-            try { for(int i=0;i<points.length();i++){JSONObject x=points.getJSONObject(i); double v=elevation?x.optDouble("alt",Double.NaN):x.optDouble("speed",0); if(!Double.isNaN(v)) vals.add(v);} } catch(Exception ignored){}
-            if(vals.size()<2)return; double min=Collections.min(vals),max=Collections.max(vals); if(max-min<0.01)max=min+1; Path path=new Path();
-            for(int i=0;i<vals.size();i++){float x=12+(getWidth()-24)*(i/(float)(vals.size()-1));float y=(float)(getHeight()-12-(getHeight()-24)*((vals.get(i)-min)/(max-min)));if(i==0)path.moveTo(x,y);else path.lineTo(x,y);}c.drawPath(path,p);
+        final JSONArray points;
+        final boolean elevation;
+        final boolean miles;
+        final Paint linePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        final Paint gridPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        final Paint textPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        final Paint fillPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+
+        RunChartView(Context c, JSONArray pts, boolean elevation, boolean miles) {
+            super(c); this.points=pts; this.elevation=elevation; this.miles=miles;
+            linePaint.setStrokeWidth(4f); linePaint.setStyle(Paint.Style.STROKE); linePaint.setColor(Color.rgb(25,25,25));
+            gridPaint.setStrokeWidth(1f); gridPaint.setColor(Color.rgb(205,205,205));
+            textPaint.setTextSize(27f); textPaint.setColor(Color.rgb(80,80,80)); textPaint.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+            fillPaint.setStyle(Paint.Style.FILL); fillPaint.setColor(Color.argb(38, 30, 100, 230));
+            setBackgroundColor(Color.rgb(248,248,248));
+        }
+
+        @Override protected void onDraw(Canvas canvas) {
+            super.onDraw(canvas);
+            if (points.length() < 2) return;
+
+            ArrayList<Double> distancesM = new ArrayList<>();
+            ArrayList<Double> values = new ArrayList<>();
+            ArrayList<Long> times = new ArrayList<>();
+            double cumulative = 0.0;
+            float[] dOut = new float[1];
+
+            try {
+                JSONObject first = points.getJSONObject(0);
+                double prevLat = first.getDouble("lat"), prevLon = first.getDouble("lon");
+                long prevT = first.optLong("t", 0);
+                distancesM.add(0.0);
+                times.add(prevT);
+                double firstVal = elevation ? first.optDouble("alt", Double.NaN) : Double.NaN;
+                values.add(firstVal);
+
+                for (int i=1;i<points.length();i++) {
+                    JSONObject x = points.getJSONObject(i);
+                    double lat=x.getDouble("lat"), lon=x.getDouble("lon");
+                    Location.distanceBetween(prevLat, prevLon, lat, lon, dOut);
+                    if (dOut[0] > 0.5f && dOut[0] < 150f) cumulative += dOut[0];
+                    long t=x.optLong("t", prevT);
+                    distancesM.add(cumulative);
+                    times.add(t);
+
+                    if (elevation) {
+                        values.add(x.optDouble("alt", Double.NaN));
+                    } else {
+                        int back=i-1;
+                        while(back>0 && t - times.get(back) < 10000L) back--;
+                        double windowDist = cumulative - distancesM.get(back);
+                        long dt = t - times.get(back);
+                        double speed = dt >= 3000 ? windowDist/(dt/1000.0) : 0.0;
+                        double unitM = miles ? 1609.344 : 1000.0;
+                        double paceMin = speed > 0.45 ? (unitM/speed)/60.0 : Double.NaN;
+                        if (paceMin > 1.5 && paceMin < 30.0) values.add(paceMin); else values.add(Double.NaN);
+                    }
+                    prevLat=lat; prevLon=lon; prevT=t;
+                }
+            } catch(Exception ignored) { return; }
+
+            ArrayList<Double> finite = new ArrayList<>();
+            for(Double v:values) if(v!=null && !Double.isNaN(v) && !Double.isInfinite(v)) finite.add(v);
+            if (finite.size() < 2 || cumulative <= 0.5) return;
+
+            double min=Collections.min(finite), max=Collections.max(finite);
+            if (elevation) {
+                double pad=Math.max(2.0,(max-min)*0.15); min-=pad; max+=pad;
+            } else {
+                double pad=Math.max(0.25,(max-min)*0.12); min=Math.max(0,min-pad); max+=pad;
+            }
+            if(max-min<0.01) max=min+1;
+
+            float left=82, right=getWidth()-18, top=26, bottom=getHeight()-52;
+            int yTicks=4, xTicks=4;
+
+            for(int i=0;i<=yTicks;i++){
+                float y=top+(bottom-top)*(i/(float)yTicks);
+                canvas.drawLine(left,y,right,y,gridPaint);
+                double v=max-(max-min)*(i/(double)yTicks);
+                String s=elevation ? String.format(Locale.US,"%.0f",v) : paceLabel(v);
+                canvas.drawText(s,8,y+9,textPaint);
+            }
+            for(int i=0;i<=xTicks;i++){
+                float x=left+(right-left)*(i/(float)xTicks);
+                canvas.drawLine(x,top,x,bottom,gridPaint);
+                double dm=cumulative*(i/(double)xTicks);
+                double shown=miles?dm/1609.344:dm/1000.0;
+                String s=shown<10?String.format(Locale.US,"%.1f",shown):String.format(Locale.US,"%.0f",shown);
+                float w=textPaint.measureText(s);
+                canvas.drawText(s,x-w/2,getHeight()-18,textPaint);
+            }
+
+            Path line=new Path(); Path fill=new Path(); boolean started=false;
+            for(int i=0;i<values.size();i++){
+                double v=values.get(i); if(Double.isNaN(v)||Double.isInfinite(v))continue;
+                float x=(float)(left+(right-left)*(distancesM.get(i)/cumulative));
+                float y=(float)(bottom-(bottom-top)*((v-min)/(max-min)));
+                if(!started){line.moveTo(x,y);fill.moveTo(x,bottom);fill.lineTo(x,y);started=true;}
+                else {line.lineTo(x,y);fill.lineTo(x,y);}
+            }
+            if(started){
+                fill.lineTo(right,bottom); fill.close();
+                canvas.drawPath(fill,fillPaint); canvas.drawPath(line,linePaint);
+            }
+
+            String yLabel=elevation ? (miles ? "Altitude (ft)" : "Altitude (m)") : (miles ? "Pace (min/mi)" : "Pace (min/km)");
+            String xLabel=miles ? "Distance (mi)" : "Distance (km)";
+            textPaint.setTextSize(24f);
+            canvas.drawText(xLabel, Math.max(left, right-textPaint.measureText(xLabel)), getHeight()-18, textPaint);
+            canvas.save();
+            canvas.rotate(-90);
+            canvas.drawText(yLabel, -bottom, 26, textPaint);
+            canvas.restore();
+
+            if(!elevation){
+                long totalMs=times.get(times.size()-1)-times.get(0);
+                String elapsed=String.format(Locale.US,"Time %02d:%02d:%02d",(totalMs/1000)/3600,((totalMs/1000)%3600)/60,(totalMs/1000)%60);
+                canvas.drawText(elapsed,left,top+24,textPaint);
+            }
+        }
+
+        private String paceLabel(double minutes) {
+            int m=(int)Math.floor(minutes);
+            int s=(int)Math.round((minutes-m)*60.0);
+            if(s==60){m++;s=0;}
+            return String.format(Locale.US,"%d:%02d",m,s);
         }
     }
 }
