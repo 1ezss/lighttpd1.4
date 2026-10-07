@@ -1,0 +1,52 @@
+name: RunTracker UI QA
+on:
+  push:
+    branches: [runtracker-build-temp]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  ui-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+      - name: Build debug APK
+        run: gradle :app:assembleDebug
+      - name: Android emulator UI verification
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          disable-animations: true
+          script: |
+            set -e
+            adb install -r app/build/outputs/apk/debug/app-debug.apk
+            adb shell am force-stop com.runtracker.app
+            adb shell pm clear com.runtracker.app
+            adb shell am start -n com.runtracker.app/.MainActivity
+            sleep 4
+            adb shell uiautomator dump /sdcard/settings.xml
+            adb pull /sdcard/settings.xml settings.xml
+            echo "=== UI hierarchy first-run Settings ==="
+            cat settings.xml
+            grep -F 'text="Weight (kg)"' settings.xml
+            grep -F 'text="Height (cm)"' settings.xml
+            grep -F 'text="Target weight (kg)"' settings.xml
+            adb exec-out screencap -p > settings-first-run.png
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: RunTracker-v0.1.2-qa
+          path: |
+            settings.xml
+            settings-first-run.png
