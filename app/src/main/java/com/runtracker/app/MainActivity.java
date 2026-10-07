@@ -26,7 +26,7 @@ import java.text.SimpleDateFormat;
 import java.util.*;
 
 /**
- * RunTracker v0.1.2
+ * RunTracker v0.1.4
  * Single-activity first working build. The code is intentionally explicit and heavily named
  * so it can later be split into ViewModel / repository / persistence modules without ambiguity.
  */
@@ -44,6 +44,7 @@ public class MainActivity extends Activity implements SensorEventListener {
     private LocationCallback locationCallback;
     private SensorManager sensorManager;
     private Sensor stepSensor;
+    private Sensor pressureSensor;
 
     private boolean running = false;
     private boolean paused = false;
@@ -62,6 +63,15 @@ public class MainActivity extends Activity implements SensorEventListener {
     private String pendingRunPhotoUri = "";
     private JSONObject currentSummaryRun;
     private double currentSmoothedSpeedMps = 0.0;
+    private double currentStepEstimatedSpeedMps = 0.0;
+    private final ArrayDeque<StepSample> recentStepSamples = new ArrayDeque<>();
+    private long lastAcceptedLocationMs = 0L;
+    private float lastAcceptedHorizontalAccuracyM = Float.NaN;
+
+    // Barometric altitude is preferred for relative elevation changes when the device has a pressure sensor.
+    private double barometerBaselinePressureHpa = Double.NaN;
+    private double barometerRelativeAltitudeM = 0.0;
+    private double barometerAnchorAltitudeM = Double.NaN;
 
     private final Runnable timerRunnable = new Runnable() {
         @Override public void run() {
@@ -78,6 +88,7 @@ public class MainActivity extends Activity implements SensorEventListener {
         locationClient = LocationServices.getFusedLocationProviderClient(this);
         sensorManager = (SensorManager) getSystemService(SENSOR_SERVICE);
         stepSensor = sensorManager.getDefaultSensor(Sensor.TYPE_STEP_COUNTER);
+        pressureSensor = sensorManager.getDefaultSensor(Sensor.TYPE_PRESSURE);
         createLocationCallback();
         showHome();
         if (!prefs.getBoolean("settings_saved_once", false)) {
@@ -89,6 +100,9 @@ public class MainActivity extends Activity implements SensorEventListener {
         super.onResume();
         if (stepSensor != null && hasActivityPermission()) {
             sensorManager.registerListener(this, stepSensor, SensorManager.SENSOR_DELAY_NORMAL);
+        }
+        if (pressureSensor != null) {
+            sensorManager.registerListener(this, pressureSensor, SensorManager.SENSOR_DELAY_NORMAL);
         }
     }
 
@@ -173,8 +187,16 @@ public class MainActivity extends Activity implements SensorEventListener {
         controls.addView(pauseButton, new LinearLayout.LayoutParams(0, dp(58), 1f));
         controls.addView(finishButton, new LinearLayout.LayoutParams(0, dp(58), 1f));
         root.addView(controls);
-        pauseButton.setEnabled(false);
-        finishButton.setEnabled(false);
+        if (running) {
+            startButton.setEnabled(false);
+            pauseButton.setEnabled(true);
+            finishButton.setEnabled(true);
+            pauseButton.setText(paused ? "RESUME" : "PAUSE");
+        } else {
+            startButton.setEnabled(true);
+            pauseButton.setEnabled(false);
+            finishButton.setEnabled(false);
+        }
         startButton.setOnClickListener(v -> startRun());
         pauseButton.setOnClickListener(v -> togglePause());
         finishButton.setOnClickListener(v -> finishRun());
@@ -182,6 +204,8 @@ public class MainActivity extends Activity implements SensorEventListener {
         Button history = sportyButton(tr("RUN HISTORY", "HISTORIQUE", "היסטוריית ריצות"));
         history.setOnClickListener(v -> showHistory());
         root.addView(history);
+
+        if (running) updateLiveMetrics();
 
         TextView version = label("RunTracker v" + getVersionName());
         version.setGravity(Gravity.CENTER);
@@ -238,7 +262,11 @@ public class MainActivity extends Activity implements SensorEventListener {
         String savedPhoto = prefs.getString("profile_photo", "");
         if (!savedPhoto.isEmpty()) try { profile.setImageURI(Uri.parse(savedPhoto)); } catch (Exception ignored) {}
         root.addView(profile, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(130)));
-        Button choosePhoto = sportyButton(tr("CHOOSE PHOTO", "CHOISIR PHOTO", "בחר תמונה"));
+        profile.setOnClickListener(v -> chooseImage(REQ_PROFILE_PHOTO));
+        Button choosePhoto = sportyButton(tr(
+            "ADD / REPLACE PROFILE PHOTO",
+            "AJOUTER / REMPLACER LA PHOTO",
+            "הוסף / החלף תמונת פרופיל"));
         choosePhoto.setOnClickListener(v -> chooseImage(REQ_PROFILE_PHOTO));
         root.addView(choosePhoto);
 
@@ -270,6 +298,8 @@ public class MainActivity extends Activity implements SensorEventListener {
 
         Button save = sportyButton(tr("SAVE SETTINGS", "ENREGISTRER", "שמור הגדרות"));
         save.setOnClickListener(v -> {
+            boolean oldGpsEnabled = prefs.getBoolean("gps", true);
+            boolean newGpsEnabled = gps.isChecked();
             prefs.edit()
                 .putBoolean("gps", gps.isChecked())
                 .putInt("language", language.getSelectedItemPosition())
@@ -282,6 +312,15 @@ public class MainActivity extends Activity implements SensorEventListener {
                 .putBoolean("settings_saved_once", true)
                 .apply();
             log("Settings saved");
+            if (running && oldGpsEnabled != newGpsEnabled) {
+                if (newGpsEnabled) {
+                    if (ensurePermissions()) startLocationUpdates();
+                } else {
+                    stopLocationUpdates();
+                    previousLocation = null;
+                    currentSmoothedSpeedMps = 0.0;
+                }
+            }
             showHome();
         });
         root.addView(save);
@@ -311,6 +350,9 @@ public class MainActivity extends Activity implements SensorEventListener {
         startEpochMs = System.currentTimeMillis(); totalPausedMs = 0; pauseStartedMs = 0;
         initialStepCounter = -1; currentSteps = 0; totalDistanceMeters = 0; totalCalories = 0;
         previousLocation = null; route.clear(); weather = new WeatherSnapshot(); currentSmoothedSpeedMps = 0.0;
+        currentStepEstimatedSpeedMps = 0.0; recentStepSamples.clear();
+        lastAcceptedLocationMs = 0L; lastAcceptedHorizontalAccuracyM = Float.NaN;
+        barometerBaselinePressureHpa = Double.NaN; barometerRelativeAltitudeM = 0.0; barometerAnchorAltitudeM = Double.NaN;
         startButton.setEnabled(false); pauseButton.setEnabled(true); finishButton.setEnabled(true);
         log("Run started at " + startEpochMs);
         if (prefs.getBoolean("gps", true)) startLocationUpdates();
@@ -369,6 +411,11 @@ public class MainActivity extends Activity implements SensorEventListener {
     private void processLocation(Location loc) {
         if (loc.getAccuracy() > 40f) return;
         long now = System.currentTimeMillis();
+        lastAcceptedLocationMs = now;
+        lastAcceptedHorizontalAccuracyM = loc.getAccuracy();
+        if (pressureSensor != null && !Double.isNaN(barometerBaselinePressureHpa) && Double.isNaN(barometerAnchorAltitudeM)) {
+            barometerAnchorAltitudeM = loc.hasAltitude() ? loc.getAltitude() : 0.0;
+        }
         double reliableAltitude = reliableAltitudeMeters(loc);
         float speedAccuracy = (Build.VERSION.SDK_INT >= 26 && loc.hasSpeedAccuracy()) ? loc.getSpeedAccuracyMetersPerSecond() : Float.NaN;
         float verticalAccuracy = (Build.VERSION.SDK_INT >= 26 && loc.hasVerticalAccuracy()) ? loc.getVerticalAccuracyMeters() : Float.NaN;
@@ -403,6 +450,9 @@ public class MainActivity extends Activity implements SensorEventListener {
      * Unreliable altitude is stored as unavailable instead of creating a fictitious climb.
      */
     private double reliableAltitudeMeters(Location loc) {
+        if (pressureSensor != null && !Double.isNaN(barometerBaselinePressureHpa) && !Double.isNaN(barometerAnchorAltitudeM)) {
+            return barometerAnchorAltitudeM + barometerRelativeAltitudeM;
+        }
         if (loc == null || !loc.hasAltitude()) return Double.NaN;
         if (loc.getAccuracy() > 20f) return Double.NaN;
         if (Build.VERSION.SDK_INT >= 26) {
@@ -479,9 +529,26 @@ public class MainActivity extends Activity implements SensorEventListener {
         distanceValue.setText(String.format(Locale.US, "%.2f %s", dist, miles ? "mi" : "km"));
         double avgSpeedMps = elapsed > 0 ? totalDistanceMeters / (elapsed / 1000.0) : 0;
         avgPaceValue.setText(formatPaceOrSpeed(avgSpeedMps, miles));
-        if (currentSmoothedSpeedMps > 0) currentPaceValue.setText(formatPaceOrSpeed(currentSmoothedSpeedMps, miles));
-        else if (running) currentPaceValue.setText(tr("GPS weak", "GPS faible", "GPS חלש"));
-        else currentPaceValue.setText("--:--");
+        double liveSpeedMps = currentSmoothedSpeedMps;
+        boolean usingStepFallback = false;
+        long now = System.currentTimeMillis();
+        boolean gpsFreshAndUsable = prefs.getBoolean("gps", true)
+            && lastAcceptedLocationMs > 0
+            && now - lastAcceptedLocationMs <= 8000L
+            && !Float.isNaN(lastAcceptedHorizontalAccuracyM)
+            && lastAcceptedHorizontalAccuracyM <= 25f
+            && currentSmoothedSpeedMps > 0.12;
+        if (!gpsFreshAndUsable && currentStepEstimatedSpeedMps > 0.12) {
+            liveSpeedMps = currentStepEstimatedSpeedMps;
+            usingStepFallback = true;
+        }
+        if (liveSpeedMps > 0) {
+            String display = formatPaceOrSpeed(liveSpeedMps, miles);
+            if (usingStepFallback) display += " · " + tr("steps", "pas", "צעדים");
+            currentPaceValue.setText(display);
+        } else if (running) {
+            currentPaceValue.setText(tr("GPS/steps weak", "GPS/pas insuffisants", "GPS/צעדים חלשים"));
+        } else currentPaceValue.setText("--:--");
         stepsValue.setText(String.valueOf(currentSteps));
         caloriesValue.setText(String.format(Locale.US, "%.0f kcal", totalCalories));
     }
@@ -557,13 +624,49 @@ public class MainActivity extends Activity implements SensorEventListener {
     }
 
     @Override public void onSensorChanged(SensorEvent event) {
-        if (event.sensor.getType() == Sensor.TYPE_STEP_COUNTER && running && !paused) {
+        int type = event.sensor.getType();
+        if (type == Sensor.TYPE_STEP_COUNTER && running && !paused) {
             long absolute = (long)event.values[0];
             if (initialStepCounter < 0) initialStepCounter = absolute;
             currentSteps = Math.max(0, absolute - initialStepCounter);
+
+            long now = System.currentTimeMillis();
+            recentStepSamples.addLast(new StepSample(now, currentSteps));
+            while (!recentStepSamples.isEmpty() && now - recentStepSamples.peekFirst().timeMs > 12_000L) {
+                recentStepSamples.removeFirst();
+            }
+            currentStepEstimatedSpeedMps = calculateStepEstimatedSpeed();
+
             if (stepsValue != null) stepsValue.setText(String.valueOf(currentSteps));
+            updateLiveMetrics();
+        } else if (type == Sensor.TYPE_PRESSURE && running && !paused) {
+            double pressureHpa = event.values[0];
+            if (Double.isNaN(barometerBaselinePressureHpa)) {
+                barometerBaselinePressureHpa = pressureHpa;
+                barometerRelativeAltitudeM = 0.0;
+                log("Barometer baseline established");
+            } else {
+                barometerRelativeAltitudeM = ElevationMath.relativeAltitudeMeters(barometerBaselinePressureHpa, pressureHpa);
+            }
         }
     }
+
+    private double calculateStepEstimatedSpeed() {
+        if (recentStepSamples.size() < 2) return 0.0;
+        StepSample first = recentStepSamples.peekFirst();
+        StepSample last = recentStepSamples.peekLast();
+        long dtMs = last.timeMs - first.timeMs;
+        long deltaSteps = last.steps - first.steps;
+        if (dtMs < 2500L || deltaSteps < 2) return 0.0;
+
+        double heightM = prefs.getFloat("height", 175f) / 100.0;
+        // Generic step-length estimate used only as a GPS fallback. It is intentionally conservative.
+        double estimatedStepLengthM = Math.max(0.45, Math.min(1.15, heightM * 0.414));
+        double stepsPerSecond = deltaSteps / (dtMs / 1000.0);
+        double speed = stepsPerSecond * estimatedStepLengthM;
+        return speed >= 0.12 && speed <= 8.0 ? speed : 0.0;
+    }
+
     @Override public void onAccuracyChanged(Sensor sensor, int accuracy) {}
 
     private boolean ensurePermissions() {
@@ -822,8 +925,14 @@ public class MainActivity extends Activity implements SensorEventListener {
 
     private String tr(String en, String fr, String he) { int l=prefs.getInt("language",0); return l==1?fr:(l==2?he:en); }
     private String formatDate(long epoch) { return new SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault()).format(new Date(epoch)); }
-    private String getVersionName() { try { return getPackageManager().getPackageInfo(getPackageName(),0).versionName; } catch(Exception e){return "0.1.2";} }
+    private String getVersionName() { try { return getPackageManager().getPackageInfo(getPackageName(),0).versionName; } catch(Exception e){return "0.1.4";} }
     private int dp(int v) { return (int)(v*getResources().getDisplayMetrics().density+0.5f); }
+
+    static class StepSample {
+        final long timeMs;
+        final long steps;
+        StepSample(long timeMs, long steps) { this.timeMs = timeMs; this.steps = steps; }
+    }
 
     static class RoutePoint {
         final double lat,lon,alt;
@@ -916,6 +1025,8 @@ public class MainActivity extends Activity implements SensorEventListener {
                     prevLat=lat; prevLon=lon; prevT=t;
                 }
             } catch(Exception ignored) { return; }
+
+            if (elevation) values = ElevationMath.medianSmoothPreservingGaps(values, 2);
 
             ArrayList<Double> finite = new ArrayList<>();
             for(Double v:values) if(v!=null && !Double.isNaN(v) && !Double.isInfinite(v)) finite.add(v);
