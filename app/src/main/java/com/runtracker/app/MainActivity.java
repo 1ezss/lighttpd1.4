@@ -38,6 +38,7 @@ public class MainActivity extends Activity implements SensorEventListener {
     private static final String HISTORY_KEY = "run_history_json";
 
     private SharedPreferences prefs;
+    private SharedPreferences runStatePrefs;
     private LinearLayout root;
     private final Handler timerHandler = new Handler(Looper.getMainLooper());
     private FusedLocationProviderClient locationClient;
@@ -63,6 +64,7 @@ public class MainActivity extends Activity implements SensorEventListener {
     private String pendingRunPhotoUri = "";
     private JSONObject currentSummaryRun;
     private double currentSmoothedSpeedMps = 0.0;
+    private long serviceElapsedMs = 0L;
     private double currentStepEstimatedSpeedMps = 0.0;
     private final ArrayDeque<StepSample> recentStepSamples = new ArrayDeque<>();
     private long lastAcceptedLocationMs = 0L;
@@ -76,6 +78,7 @@ public class MainActivity extends Activity implements SensorEventListener {
     private final Runnable timerRunnable = new Runnable() {
         @Override public void run() {
             if (running) {
+                syncRunStateFromService();
                 updateLiveMetrics();
                 timerHandler.postDelayed(this, 500);
             }
@@ -85,12 +88,18 @@ public class MainActivity extends Activity implements SensorEventListener {
     @Override protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
+        runStatePrefs = getSharedPreferences(ActiveRunService.STATE_PREFS, MODE_PRIVATE);
         locationClient = LocationServices.getFusedLocationProviderClient(this);
         sensorManager = (SensorManager) getSystemService(SENSOR_SERVICE);
         stepSensor = sensorManager.getDefaultSensor(Sensor.TYPE_STEP_COUNTER);
         pressureSensor = sensorManager.getDefaultSensor(Sensor.TYPE_PRESSURE);
         createLocationCallback();
+        syncRunStateFromService();
         showHome();
+        if (running) {
+            timerHandler.removeCallbacks(timerRunnable);
+            timerHandler.post(timerRunnable);
+        }
         if (!prefs.getBoolean("settings_saved_once", false)) {
             new Handler(Looper.getMainLooper()).postDelayed(this::showSettings, 250);
         }
@@ -98,17 +107,16 @@ public class MainActivity extends Activity implements SensorEventListener {
 
     @Override protected void onResume() {
         super.onResume();
-        if (stepSensor != null && hasActivityPermission()) {
-            sensorManager.registerListener(this, stepSensor, SensorManager.SENSOR_DELAY_NORMAL);
-        }
-        if (pressureSensor != null) {
-            sensorManager.registerListener(this, pressureSensor, SensorManager.SENSOR_DELAY_NORMAL);
+        syncRunStateFromService();
+        if (running) {
+            timerHandler.removeCallbacks(timerRunnable);
+            timerHandler.post(timerRunnable);
         }
     }
 
     @Override protected void onPause() {
         super.onPause();
-        sensorManager.unregisterListener(this);
+        // The foreground service intentionally continues the run while this Activity is paused.
     }
 
     private void resetRoot() {
@@ -313,14 +321,9 @@ public class MainActivity extends Activity implements SensorEventListener {
                 .apply();
             log("Settings saved");
             if (running && oldGpsEnabled != newGpsEnabled) {
-                if (newGpsEnabled) {
-                    if (ensurePermissions()) startLocationUpdates();
-                } else {
-                    stopLocationUpdates();
-                    previousLocation = null;
-                    currentSmoothedSpeedMps = 0.0;
-                }
+                sendRunServiceAction(ActiveRunService.ACTION_SETTINGS_CHANGED);
             }
+            syncRunStateFromService();
             showHome();
         });
         root.addView(save);
@@ -370,24 +373,47 @@ public class MainActivity extends Activity implements SensorEventListener {
 
     private void finishRun() {
         if (!running) return;
-        if (paused) totalPausedMs += System.currentTimeMillis() - pauseStartedMs;
-        running = false; paused = false; timerHandler.removeCallbacks(timerRunnable); stopLocationUpdates();
-        long end = System.currentTimeMillis();
-        try {
-            JSONObject run = new JSONObject();
-            run.put("id", String.valueOf(startEpochMs));
-            run.put("start", startEpochMs); run.put("end", end);
-            run.put("duration_ms", activeElapsedMs());
-            run.put("distance_m", totalDistanceMeters); run.put("steps", currentSteps); run.put("calories", totalCalories);
-            run.put("difficulty", 3); run.put("beauty", 3); run.put("notes", ""); run.put("photo", "");
-            run.put("temperature_c", weather.temperatureC); run.put("humidity", weather.humidity); run.put("wind_ms", weather.windSpeedMs); run.put("wind_dir", weather.windDirectionDeg);
-            JSONArray points = new JSONArray();
-            for (RoutePoint p : route) points.put(p.toJson());
-            run.put("route", points);
-            appendRun(run);
-            log("Run finished: " + totalDistanceMeters + " m, " + totalCalories + " kcal");
-            showRunSummary(run);
-        } catch (JSONException e) { log("Finish error: " + e.getMessage()); showHome(); }
+        pauseButton.setEnabled(false);
+        finishButton.setEnabled(false);
+        timerHandler.removeCallbacks(timerRunnable);
+        sendRunServiceAction(ActiveRunService.ACTION_FINISH);
+
+        new Handler(Looper.getMainLooper()).postDelayed(() -> {
+            syncRunStateFromService();
+            running = false;
+            paused = false;
+            long end = System.currentTimeMillis();
+
+            try {
+                JSONObject run = new JSONObject();
+                run.put("id", String.valueOf(startEpochMs));
+                run.put("start", startEpochMs);
+                run.put("end", end);
+                run.put("duration_ms", serviceElapsedMs > 0L ? serviceElapsedMs : activeElapsedMs());
+                run.put("distance_m", totalDistanceMeters);
+                run.put("steps", currentSteps);
+                run.put("calories", totalCalories);
+                run.put("difficulty", 3);
+                run.put("beauty", 3);
+                run.put("notes", "");
+                run.put("photo", "");
+                run.put("temperature_c", weather.temperatureC);
+                run.put("humidity", weather.humidity);
+                run.put("wind_ms", weather.windSpeedMs);
+                run.put("wind_dir", weather.windDirectionDeg);
+
+                JSONArray points = new JSONArray();
+                for (RoutePoint p : route) points.put(p.toJson());
+                run.put("route", points);
+
+                appendRun(run);
+                log("Run finished: " + totalDistanceMeters + " m, " + totalCalories + " kcal");
+                showRunSummary(run);
+            } catch (JSONException e) {
+                log("Finish error: " + e.getMessage());
+                showHome();
+            }
+        }, 250L);
     }
 
     private void createLocationCallback() {
@@ -522,7 +548,7 @@ public class MainActivity extends Activity implements SensorEventListener {
 
     private void updateLiveMetrics() {
         if (timeValue == null) return;
-        long elapsed = activeElapsedMs();
+        long elapsed = running && serviceElapsedMs > 0L ? serviceElapsedMs : activeElapsedMs();
         timeValue.setText(formatDuration(elapsed));
         boolean miles = prefs.getInt("distance_unit", 0) == 1;
         double dist = miles ? totalDistanceMeters / 1609.344 : totalDistanceMeters / 1000.0;
@@ -625,7 +651,7 @@ public class MainActivity extends Activity implements SensorEventListener {
 
     @Override public void onSensorChanged(SensorEvent event) {
         int type = event.sensor.getType();
-        if (type == Sensor.TYPE_STEP_COUNTER && running && !paused) {
+        if (false && type == Sensor.TYPE_STEP_COUNTER && running && !paused) {
             long absolute = (long)event.values[0];
             if (initialStepCounter < 0) initialStepCounter = absolute;
             currentSteps = Math.max(0, absolute - initialStepCounter);
@@ -903,6 +929,45 @@ public class MainActivity extends Activity implements SensorEventListener {
         if (requestCode == REQ_RUN_PHOTO && currentSummaryRun != null) { pendingRunPhotoUri = uri.toString(); showRunSummary(currentSummaryRun); }
     }
 
+    private void sendRunServiceAction(String action) {
+        Intent i = new Intent(this, ActiveRunService.class);
+        i.setAction(action);
+        startService(i);
+    }
+
+    private void syncRunStateFromService() {
+        if (runStatePrefs == null) return;
+
+        boolean wasRunning = running;
+        running = runStatePrefs.getBoolean("active", false);
+        paused = runStatePrefs.getBoolean("paused", false);
+        startEpochMs = runStatePrefs.getLong("start", startEpochMs);
+        pauseStartedMs = runStatePrefs.getLong("pause_started", 0L);
+        totalPausedMs = runStatePrefs.getLong("total_paused", totalPausedMs);
+        serviceElapsedMs = runStatePrefs.getLong("elapsed_ms", serviceElapsedMs);
+        currentSteps = runStatePrefs.getLong("steps", currentSteps);
+        totalDistanceMeters = runStatePrefs.getFloat("distance_m", (float)totalDistanceMeters);
+        totalCalories = runStatePrefs.getFloat("calories", (float)totalCalories);
+        currentSmoothedSpeedMps = runStatePrefs.getFloat("gps_speed_mps", 0f);
+        currentStepEstimatedSpeedMps = runStatePrefs.getFloat("step_speed_mps", 0f);
+        lastAcceptedLocationMs = runStatePrefs.getLong("last_gps_ms", 0L);
+        lastAcceptedHorizontalAccuracyM = runStatePrefs.getFloat("last_gps_accuracy", Float.NaN);
+
+        weather.valid = runStatePrefs.getBoolean("weather_valid", false);
+        weather.temperatureC = runStatePrefs.getFloat("temperature_c", Float.NaN);
+        weather.humidity = runStatePrefs.getFloat("humidity", Float.NaN);
+        weather.windSpeedMs = runStatePrefs.getFloat("wind_ms", 0f);
+        weather.windDirectionDeg = runStatePrefs.getFloat("wind_dir", 0f);
+
+        route.clear();
+        try {
+            JSONArray a = new JSONArray(runStatePrefs.getString("route", "[]"));
+            for (int i=0;i<a.length();i++) route.add(RoutePoint.fromJson(a.getJSONObject(i)));
+        } catch (Exception e) {
+            if (wasRunning) log("Unable to restore service route: " + e.getMessage());
+        }
+    }
+
     private JSONArray historyArray() { try { return new JSONArray(prefs.getString(HISTORY_KEY, "[]")); } catch (Exception e) { return new JSONArray(); } }
     private void appendRun(JSONObject run) { JSONArray a=historyArray(); a.put(run); prefs.edit().putString(HISTORY_KEY,a.toString()).apply(); }
     private void replaceRun(JSONObject run) {
@@ -952,6 +1017,15 @@ public class MainActivity extends Activity implements SensorEventListener {
             if (!Float.isNaN(verticalAccuracyM)) o.put("vertical_acc",verticalAccuracyM);
             o.put("horizontal_acc",horizontalAccuracyM);
             return o;
+        }
+        static RoutePoint fromJson(JSONObject o) {
+            return new RoutePoint(
+                o.optDouble("lat",0), o.optDouble("lon",0),
+                o.isNull("alt") ? Double.NaN : o.optDouble("alt",Double.NaN),
+                o.optLong("t",0), (float)o.optDouble("speed",0),
+                (float)o.optDouble("speed_acc",Float.NaN),
+                (float)o.optDouble("vertical_acc",Float.NaN),
+                (float)o.optDouble("horizontal_acc",Float.NaN));
         }
     }
     static class WeatherSnapshot { boolean valid=false; double temperatureC=Double.NaN,humidity=Double.NaN,windSpeedMs=0,windDirectionDeg=0; }
