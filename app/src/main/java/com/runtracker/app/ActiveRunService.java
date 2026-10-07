@@ -34,6 +34,16 @@ public class ActiveRunService extends Service implements SensorEventListener {
 
     private SharedPreferences state;
     private SharedPreferences appPrefs;
+    private final Handler heartbeatHandler = new Handler(Looper.getMainLooper());
+    private final Runnable heartbeat = new Runnable() {
+        @Override public void run() {
+            if (active) {
+                checkpoint();
+                updateNotification();
+                heartbeatHandler.postDelayed(this, 1000L);
+            }
+        }
+    };
     private FusedLocationProviderClient locationClient;
     private LocationCallback locationCallback;
     private SensorManager sensorManager;
@@ -97,12 +107,15 @@ public class ActiveRunService extends Service implements SensorEventListener {
             registerSensors();
             applyTrackingSources();
             checkpoint();
+            heartbeatHandler.removeCallbacks(heartbeat);
+            heartbeatHandler.post(heartbeat);
         }
 
         return active ? START_STICKY : START_NOT_STICKY;
     }
 
     @Override public void onDestroy() {
+        heartbeatHandler.removeCallbacks(heartbeat);
         if (active) checkpoint();
         stopLocationUpdates();
         if (sensorManager != null) sensorManager.unregisterListener(this);
@@ -137,6 +150,8 @@ public class ActiveRunService extends Service implements SensorEventListener {
         registerSensors();
         applyTrackingSources();
         checkpoint();
+        heartbeatHandler.removeCallbacks(heartbeat);
+        heartbeatHandler.post(heartbeat);
     }
 
     private void pauseRun() {
@@ -172,6 +187,7 @@ public class ActiveRunService extends Service implements SensorEventListener {
         }
         active = false;
         paused = false;
+        heartbeatHandler.removeCallbacks(heartbeat);
         checkpoint();
         stopLocationUpdates();
         sensorManager.unregisterListener(this);
