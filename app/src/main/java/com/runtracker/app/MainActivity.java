@@ -349,35 +349,95 @@ public class MainActivity extends Activity implements SensorEventListener {
     private void startRun() {
         if (running) return;
         if (!ensurePermissions()) return;
-        running = true; paused = false;
-        startEpochMs = System.currentTimeMillis(); totalPausedMs = 0; pauseStartedMs = 0;
-        initialStepCounter = -1; currentSteps = 0; totalDistanceMeters = 0; totalCalories = 0;
-        previousLocation = null; route.clear(); weather = new WeatherSnapshot(); currentSmoothedSpeedMps = 0.0;
-        currentStepEstimatedSpeedMps = 0.0; recentStepSamples.clear();
-        lastAcceptedLocationMs = 0L; lastAcceptedHorizontalAccuracyM = Float.NaN;
-        barometerBaselinePressureHpa = Double.NaN; barometerRelativeAltitudeM = 0.0; barometerAnchorAltitudeM = Double.NaN;
-        startButton.setEnabled(false); pauseButton.setEnabled(true); finishButton.setEnabled(true);
-        log("Run started at " + startEpochMs);
-        if (prefs.getBoolean("gps", true)) startLocationUpdates();
+
+        running = true;
+        paused = false;
+        startEpochMs = System.currentTimeMillis();
+        totalPausedMs = 0L;
+        pauseStartedMs = 0L;
+        serviceElapsedMs = 0L;
+        initialStepCounter = -1L;
+        currentSteps = 0L;
+        totalDistanceMeters = 0.0;
+        totalCalories = 0.0;
+        previousLocation = null;
+        route.clear();
+        weather = new WeatherSnapshot();
+        currentSmoothedSpeedMps = 0.0;
+        currentStepEstimatedSpeedMps = 0.0;
+        recentStepSamples.clear();
+        lastAcceptedLocationMs = 0L;
+        lastAcceptedHorizontalAccuracyM = Float.NaN;
+        barometerBaselinePressureHpa = Double.NaN;
+        barometerRelativeAltitudeM = 0.0;
+        barometerAnchorAltitudeM = Double.NaN;
+
+        startButton.setEnabled(false);
+        pauseButton.setEnabled(true);
+        finishButton.setEnabled(true);
+
+        // Seed the shared state before the first UI poll so the screen cannot
+        // temporarily fall back to IDLE while the foreground service starts.
+        runStatePrefs.edit()
+            .putBoolean("active", true)
+            .putBoolean("paused", false)
+            .putLong("start", startEpochMs)
+            .putLong("pause_started", 0L)
+            .putLong("total_paused", 0L)
+            .putLong("elapsed_ms", 0L)
+            .putLong("steps", 0L)
+            .putFloat("distance_m", 0f)
+            .putFloat("calories", 0f)
+            .putFloat("gps_speed_mps", 0f)
+            .putFloat("step_speed_mps", 0f)
+            .putString("pace_source", "none")
+            .putString("route", "[]")
+            .apply();
+
+        log("Run started at " + startEpochMs + " using foreground service");
+
+        Intent serviceIntent = new Intent(this, ActiveRunService.class);
+        serviceIntent.setAction(ActiveRunService.ACTION_START);
+        if (Build.VERSION.SDK_INT >= 26) {
+            startForegroundService(serviceIntent);
+        } else {
+            startService(serviceIntent);
+        }
+
+        timerHandler.removeCallbacks(timerRunnable);
         timerHandler.post(timerRunnable);
     }
 
     private void togglePause() {
         if (!running) return;
+
         if (!paused) {
-            paused = true; pauseStartedMs = System.currentTimeMillis(); pauseButton.setText("RESUME"); log("Run paused");
+            paused = true;
+            pauseStartedMs = System.currentTimeMillis();
+            pauseButton.setText("RESUME");
+            sendRunServiceAction(ActiveRunService.ACTION_PAUSE);
+            log("Run paused");
         } else {
-            paused = false; totalPausedMs += System.currentTimeMillis() - pauseStartedMs; pauseStartedMs = 0; pauseButton.setText("PAUSE"); previousLocation = null; log("Run resumed");
+            paused = false;
+            if (pauseStartedMs > 0L) {
+                totalPausedMs += System.currentTimeMillis() - pauseStartedMs;
+            }
+            pauseStartedMs = 0L;
+            pauseButton.setText("PAUSE");
+            sendRunServiceAction(ActiveRunService.ACTION_RESUME);
+            log("Run resumed");
         }
     }
 
     private void finishRun() {
         if (!running) return;
+
         pauseButton.setEnabled(false);
         finishButton.setEnabled(false);
         timerHandler.removeCallbacks(timerRunnable);
         sendRunServiceAction(ActiveRunService.ACTION_FINISH);
 
+        // Give the foreground service a short moment to write its final checkpoint.
         new Handler(Looper.getMainLooper()).postDelayed(() -> {
             syncRunStateFromService();
             running = false;
@@ -413,7 +473,7 @@ public class MainActivity extends Activity implements SensorEventListener {
                 log("Finish error: " + e.getMessage());
                 showHome();
             }
-        }, 250L);
+        }, 350L);
     }
 
     private void createLocationCallback() {
