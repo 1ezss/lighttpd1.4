@@ -26,7 +26,7 @@ import java.text.SimpleDateFormat;
 import java.util.*;
 
 /**
- * RunTracker v0.1.1
+ * RunTracker v0.1.2
  * Single-activity first working build. The code is intentionally explicit and heavily named
  * so it can later be split into ViewModel / repository / persistence modules without ambiguity.
  */
@@ -252,10 +252,17 @@ public class MainActivity extends Activity implements SensorEventListener {
         }
         root.addView(avatars);
 
+        root.addView(label(tr("Weight (kg)", "Poids (kg)", "משקל בקג")));
         EditText weight = numberField(tr("Weight (kg)", "Poids (kg)", "משקל בקג"), prefs.getFloat("weight", 70f));
+        root.addView(weight);
+
+        root.addView(label(tr("Height (cm)", "Taille (cm)", "גובה בסמ")));
         EditText height = numberField(tr("Height (cm)", "Taille (cm)", "גובה בסמ"), prefs.getFloat("height", 175f));
+        root.addView(height);
+
+        root.addView(label(tr("Target weight (kg)", "Poids cible (kg)", "משקל יעד בקג")));
         EditText target = numberField(tr("Target weight (kg)", "Poids cible (kg)", "משקל יעד בקג"), prefs.getFloat("target_weight", 70f));
-        root.addView(weight); root.addView(height); root.addView(target);
+        root.addView(target);
 
         Button logs = sportyButton(tr("DEBUG / LOGS", "DEBUG / LOGS", "DEBUG / LOGS"));
         logs.setOnClickListener(v -> showLogs());
@@ -362,7 +369,11 @@ public class MainActivity extends Activity implements SensorEventListener {
     private void processLocation(Location loc) {
         if (loc.getAccuracy() > 40f) return;
         long now = System.currentTimeMillis();
-        RoutePoint current = new RoutePoint(loc.getLatitude(), loc.getLongitude(), loc.hasAltitude() ? loc.getAltitude() : Double.NaN, now, loc.hasSpeed() ? loc.getSpeed() : 0f);
+        double reliableAltitude = reliableAltitudeMeters(loc);
+        float speedAccuracy = (Build.VERSION.SDK_INT >= 26 && loc.hasSpeedAccuracy()) ? loc.getSpeedAccuracyMetersPerSecond() : Float.NaN;
+        float verticalAccuracy = (Build.VERSION.SDK_INT >= 26 && loc.hasVerticalAccuracy()) ? loc.getVerticalAccuracyMeters() : Float.NaN;
+        RoutePoint current = new RoutePoint(loc.getLatitude(), loc.getLongitude(), reliableAltitude, now,
+            loc.hasSpeed() ? loc.getSpeed() : 0f, speedAccuracy, verticalAccuracy, loc.getAccuracy());
         route.add(current);
         if (route.size() == 1) fetchWeatherAsync(current.lat, current.lon);
         if (previousLocation != null) {
@@ -372,7 +383,11 @@ public class MainActivity extends Activity implements SensorEventListener {
                 totalDistanceMeters += d;
                 double speedMps = d / (dtMs / 1000.0);
                 double grade = 0.0;
-                if (previousLocation.hasAltitude() && loc.hasAltitude() && d > 5) grade = (loc.getAltitude() - previousLocation.getAltitude()) / d;
+                RoutePoint previousPoint = route.get(route.size()-2);
+                if (!Double.isNaN(previousPoint.alt) && !Double.isNaN(current.alt) && d > 5) {
+                    grade = (current.alt - previousPoint.alt) / d;
+                    if (Math.abs(grade) > 0.35) grade = 0.0; // reject impossible GPS altitude jumps
+                }
                 double segKcal = calculateSegmentCalories(d, speedMps, grade, dtMs / 60000.0, previousLocation, loc);
                 totalCalories += Math.max(0, segKcal);
             }
@@ -380,6 +395,22 @@ public class MainActivity extends Activity implements SensorEventListener {
         previousLocation = loc;
         currentSmoothedSpeedMps = calculateSmoothedCurrentSpeed();
         updateLiveMetrics();
+    }
+
+    /**
+     * GPS altitude is substantially noisier than horizontal position, especially indoors.
+     * We only retain altitude when Android reports acceptable horizontal and vertical accuracy.
+     * Unreliable altitude is stored as unavailable instead of creating a fictitious climb.
+     */
+    private double reliableAltitudeMeters(Location loc) {
+        if (loc == null || !loc.hasAltitude()) return Double.NaN;
+        if (loc.getAccuracy() > 20f) return Double.NaN;
+        if (Build.VERSION.SDK_INT >= 26) {
+            if (!loc.hasVerticalAccuracy() || loc.getVerticalAccuracyMeters() > 10f) return Double.NaN;
+        }
+        double altitude = loc.getAltitude();
+        if (altitude < -500 || altitude > 7000) return Double.NaN;
+        return altitude;
     }
 
     /**
@@ -448,38 +479,57 @@ public class MainActivity extends Activity implements SensorEventListener {
         distanceValue.setText(String.format(Locale.US, "%.2f %s", dist, miles ? "mi" : "km"));
         double avgSpeedMps = elapsed > 0 ? totalDistanceMeters / (elapsed / 1000.0) : 0;
         avgPaceValue.setText(formatPaceOrSpeed(avgSpeedMps, miles));
-        currentPaceValue.setText(formatPaceOrSpeed(currentSmoothedSpeedMps, miles));
+        if (currentSmoothedSpeedMps > 0) currentPaceValue.setText(formatPaceOrSpeed(currentSmoothedSpeedMps, miles));
+        else if (running) currentPaceValue.setText(tr("GPS weak", "GPS faible", "GPS חלש"));
+        else currentPaceValue.setText("--:--");
         stepsValue.setText(String.valueOf(currentSteps));
         caloriesValue.setText(String.format(Locale.US, "%.0f kcal", totalCalories));
     }
 
     /**
-     * Current pace is intentionally NOT based on the last raw GPS speed sample.
-     * It is calculated from a rolling GPS window so temporary satellite jitter does not
-     * produce impossible pace values while the runner is moving steadily.
+     * Current pace uses a short rolling path plus Android's native speed estimate when reliable.
+     * This reacts faster than the v0.1.1 ten-second window while still damping one-sample GPS jitter.
      */
     private double calculateSmoothedCurrentSpeed() {
         if (route.size() < 2) return 0.0;
         int last = route.size() - 1;
         RoutePoint newest = route.get(last);
-        long targetWindowMs = 10_000L;
+        long targetWindowMs = 7_000L;
         int first = last - 1;
         while (first > 0 && newest.timeMs - route.get(first).timeMs < targetWindowMs) first--;
+
         RoutePoint oldest = route.get(first);
         long dt = newest.timeMs - oldest.timeMs;
-        if (dt < 3_000L) return 0.0;
-
-        double distance = 0.0;
-        float[] out = new float[1];
-        for (int i = first + 1; i <= last; i++) {
-            RoutePoint a = route.get(i - 1);
-            RoutePoint b = route.get(i);
-            Location.distanceBetween(a.lat, a.lon, b.lat, b.lon, out);
-            if (out[0] > 0.5f && out[0] < 120f) distance += out[0];
+        double pathSpeed = 0.0;
+        if (dt >= 2_500L) {
+            double distance = 0.0;
+            float[] out = new float[1];
+            for (int i = first + 1; i <= last; i++) {
+                RoutePoint a = route.get(i - 1);
+                RoutePoint b = route.get(i);
+                Location.distanceBetween(a.lat, a.lon, b.lat, b.lon, out);
+                if (out[0] >= 0.35f && out[0] < 100f) distance += out[0];
+            }
+            if (distance >= 0.8) pathSpeed = distance / (dt / 1000.0);
         }
-        double speed = distance / (dt / 1000.0);
-        if (speed < 0.45) return 0.0;
-        return Math.min(speed, 12.0);
+
+        ArrayList<Double> nativeSpeeds = new ArrayList<>();
+        for (int i = first; i <= last; i++) {
+            RoutePoint p = route.get(i);
+            boolean accuracyGood = Float.isNaN(p.speedAccuracyMps) || p.speedAccuracyMps <= 1.8f;
+            if (accuracyGood && p.speedMps >= 0.10f && p.speedMps <= 12f) nativeSpeeds.add((double)p.speedMps);
+        }
+        double nativeMedian = 0.0;
+        if (!nativeSpeeds.isEmpty()) {
+            Collections.sort(nativeSpeeds);
+            nativeMedian = nativeSpeeds.get(nativeSpeeds.size()/2);
+        }
+
+        double chosen;
+        if (pathSpeed >= 0.12 && nativeMedian >= 0.12) chosen = 0.70 * pathSpeed + 0.30 * nativeMedian;
+        else chosen = Math.max(pathSpeed, nativeMedian);
+
+        return chosen >= 0.12 ? Math.min(chosen, 12.0) : 0.0;
     }
 
     private long activeElapsedMs() {
@@ -568,9 +618,10 @@ public class MainActivity extends Activity implements SensorEventListener {
                 log("Google Maps onMapReady received");
                 gm.setOnMapLoadedCallback(() -> log("Google Maps tiles loaded successfully"));
                 drawRoute(gm, pts);
-                new Handler(Looper.getMainLooper()).postDelayed(() ->
-                    log("Google Maps diagnostic timeout check completed - if no 'tiles loaded successfully' line appears above, check API key restrictions / SHA-1 / Maps SDK for Android"),
-                    8000);
+                new Handler(Looper.getMainLooper()).postDelayed(() -> {
+                    log("Google Maps diagnostic timeout check completed - if no 'tiles loaded successfully' line appears above, checking SDK authorization logs");
+                    captureGoogleMapsSdkLogs();
+                }, 8000);
             });
         }
         root.addView(summaryLine(tr("Distance", "Distance", "מרחק"), String.format(Locale.US, "%.2f km", run.optDouble("distance_m")/1000.0)));
@@ -595,7 +646,16 @@ public class MainActivity extends Activity implements SensorEventListener {
 
         if (pts != null && pts.length() > 1) {
             root.addView(label(tr("Elevation profile", "Profil d'altitude", "גרף טיפוס")));
-            root.addView(new RunChartView(this, pts, true, prefs.getInt("distance_unit", 0) == 1), new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(230)));
+            if (isElevationUsable(pts)) {
+                root.addView(new RunChartView(this, pts, true, prefs.getInt("distance_unit", 0) == 1), new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(230)));
+            } else {
+                TextView noElevation = label(tr(
+                    "Elevation unavailable - GPS altitude accuracy is too low.",
+                    "Altitude indisponible - la précision verticale du GPS est insuffisante.",
+                    "נתוני גובה אינם זמינים - דיוק הגובה של ה-GPS נמוך מדי."));
+                noElevation.setTextSize(15);
+                root.addView(noElevation);
+            }
             root.addView(label(tr("Pace by distance", "Allure par distance", "קצב לפי מרחק")));
             root.addView(new RunChartView(this, pts, false, prefs.getInt("distance_unit", 0) == 1), new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(230)));
         }
@@ -609,6 +669,32 @@ public class MainActivity extends Activity implements SensorEventListener {
         });
         root.addView(save);
         Button home = sportyButton(tr("HOME", "ACCUEIL", "ראשי")); home.setOnClickListener(v -> showHome()); root.addView(home);
+    }
+
+    private boolean isElevationUsable(JSONArray pts) {
+        if (pts == null || pts.length() < 3) return false;
+        ArrayList<Double> alts = new ArrayList<>();
+        double distance = 0.0;
+        float[] out = new float[1];
+        try {
+            JSONObject prev = pts.getJSONObject(0);
+            for (int i=0;i<pts.length();i++) {
+                JSONObject p = pts.getJSONObject(i);
+                double a = p.optDouble("alt", Double.NaN);
+                if (!Double.isNaN(a) && !Double.isInfinite(a)) alts.add(a);
+                if (i>0) {
+                    Location.distanceBetween(prev.getDouble("lat"), prev.getDouble("lon"),
+                        p.getDouble("lat"), p.getDouble("lon"), out);
+                    if (out[0] < 150f) distance += out[0];
+                }
+                prev = p;
+            }
+        } catch (Exception e) { return false; }
+        if (alts.size() < 3) return false;
+        double span = Collections.max(alts) - Collections.min(alts);
+        // A large vertical excursion over a tiny indoor-sized route is almost certainly GPS noise.
+        if (distance < 100.0 && span > 4.0) return false;
+        return true;
     }
 
     private TextView summaryLine(String a, String b) { TextView t=label(a + ":  " + b); t.setTextSize(18); t.setTypeface(Typeface.create("sans-serif-medium",Typeface.NORMAL)); return t; }
@@ -631,10 +717,35 @@ public class MainActivity extends Activity implements SensorEventListener {
             log("Google Maps diagnostic [" + stage + "]: package=" + packageName
                 + ", version=" + version + ", signingSHA1=" + sha1
                 + ", key=" + keySummary + ", keyLength=" + (key == null ? 0 : key.length())
-                + ", internet=" + network);
+                + ", internet=" + network
+                + ", playServices=" + com.google.android.gms.common.GoogleApiAvailability.getInstance().isGooglePlayServicesAvailable(this));
         } catch (Exception e) {
             log("Google Maps diagnostic failed: " + e.getClass().getSimpleName() + ": " + e.getMessage());
         }
+    }
+
+    private void captureGoogleMapsSdkLogs() {
+        new Thread(() -> {
+            try {
+                Process process = Runtime.getRuntime().exec(new String[]{"logcat","-d","-t","300"});
+                BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
+                String line;
+                int captured = 0;
+                String realKey = getString(com.runtracker.app.R.string.google_maps_key);
+                while ((line = reader.readLine()) != null && captured < 20) {
+                    String low = line.toLowerCase(Locale.US);
+                    if (low.contains("google maps android api") || low.contains("authorization failure")
+                        || low.contains("maps sdk") || low.contains("api key")) {
+                        String safe = realKey == null ? line : line.replace(realKey, "[API_KEY]");
+                        log("Maps SDK: " + safe.trim());
+                        captured++;
+                    }
+                }
+                if (captured == 0) log("Maps SDK: no authorization message was readable from app logcat");
+            } catch (Exception e) {
+                log("Maps SDK log capture failed: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+            }
+        }).start();
     }
 
     private String runtimeSigningSha1() {
@@ -711,13 +822,28 @@ public class MainActivity extends Activity implements SensorEventListener {
 
     private String tr(String en, String fr, String he) { int l=prefs.getInt("language",0); return l==1?fr:(l==2?he:en); }
     private String formatDate(long epoch) { return new SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault()).format(new Date(epoch)); }
-    private String getVersionName() { try { return getPackageManager().getPackageInfo(getPackageName(),0).versionName; } catch(Exception e){return "0.1.1";} }
+    private String getVersionName() { try { return getPackageManager().getPackageInfo(getPackageName(),0).versionName; } catch(Exception e){return "0.1.2";} }
     private int dp(int v) { return (int)(v*getResources().getDisplayMetrics().density+0.5f); }
 
     static class RoutePoint {
-        final double lat,lon,alt; final long timeMs; final float speedMps;
-        RoutePoint(double lat,double lon,double alt,long timeMs,float speedMps){this.lat=lat;this.lon=lon;this.alt=alt;this.timeMs=timeMs;this.speedMps=speedMps;}
-        JSONObject toJson() throws JSONException { JSONObject o=new JSONObject();o.put("lat",lat);o.put("lon",lon);o.put("alt",alt);o.put("t",timeMs);o.put("speed",speedMps);return o; }
+        final double lat,lon,alt;
+        final long timeMs;
+        final float speedMps, speedAccuracyMps, verticalAccuracyM, horizontalAccuracyM;
+        RoutePoint(double lat,double lon,double alt,long timeMs,float speedMps,
+                   float speedAccuracyMps,float verticalAccuracyM,float horizontalAccuracyM){
+            this.lat=lat;this.lon=lon;this.alt=alt;this.timeMs=timeMs;this.speedMps=speedMps;
+            this.speedAccuracyMps=speedAccuracyMps;this.verticalAccuracyM=verticalAccuracyM;this.horizontalAccuracyM=horizontalAccuracyM;
+        }
+        JSONObject toJson() throws JSONException {
+            JSONObject o=new JSONObject();
+            o.put("lat",lat);o.put("lon",lon);
+            if (!Double.isNaN(alt) && !Double.isInfinite(alt)) o.put("alt",alt); else o.put("alt",JSONObject.NULL);
+            o.put("t",timeMs);o.put("speed",speedMps);
+            if (!Float.isNaN(speedAccuracyMps)) o.put("speed_acc",speedAccuracyMps);
+            if (!Float.isNaN(verticalAccuracyM)) o.put("vertical_acc",verticalAccuracyM);
+            o.put("horizontal_acc",horizontalAccuracyM);
+            return o;
+        }
     }
     static class WeatherSnapshot { boolean valid=false; double temperatureC=Double.NaN,humidity=Double.NaN,windSpeedMs=0,windDirectionDeg=0; }
 
@@ -774,7 +900,9 @@ public class MainActivity extends Activity implements SensorEventListener {
                     times.add(t);
 
                     if (elevation) {
-                        values.add(x.optDouble("alt", Double.NaN));
+                        double altitude = x.optDouble("alt", Double.NaN);
+                        if (!Double.isNaN(altitude) && miles) altitude *= 3.28084;
+                        values.add(altitude);
                     } else {
                         int back=i-1;
                         while(back>0 && t - times.get(back) < 10000L) back--;
@@ -816,37 +944,39 @@ public class MainActivity extends Activity implements SensorEventListener {
                 canvas.drawLine(x,top,x,bottom,gridPaint);
                 double dm=cumulative*(i/(double)xTicks);
                 double shown=miles?dm/1609.344:dm/1000.0;
-                String s=shown<10?String.format(Locale.US,"%.1f",shown):String.format(Locale.US,"%.0f",shown);
+                String s;
+                if (shown < 0.10) s=String.format(Locale.US,"%.3f",shown);
+                else if (shown < 1.0) s=String.format(Locale.US,"%.2f",shown);
+                else if (shown < 10.0) s=String.format(Locale.US,"%.1f",shown);
+                else s=String.format(Locale.US,"%.0f",shown);
                 float w=textPaint.measureText(s);
                 canvas.drawText(s,x-w/2,getHeight()-18,textPaint);
             }
 
-            Path line=new Path(); Path fill=new Path(); boolean started=false;
+            Path line=new Path(); Path fill=new Path(); boolean started=false; float lastX=left;
             for(int i=0;i<values.size();i++){
                 double v=values.get(i); if(Double.isNaN(v)||Double.isInfinite(v))continue;
                 float x=(float)(left+(right-left)*(distancesM.get(i)/cumulative));
                 float y=(float)(bottom-(bottom-top)*((v-min)/(max-min)));
                 if(!started){line.moveTo(x,y);fill.moveTo(x,bottom);fill.lineTo(x,y);started=true;}
                 else {line.lineTo(x,y);fill.lineTo(x,y);}
+                lastX=x;
             }
             if(started){
-                fill.lineTo(right,bottom); fill.close();
+                fill.lineTo(lastX,bottom); fill.close();
                 canvas.drawPath(fill,fillPaint); canvas.drawPath(line,linePaint);
             }
 
             String yLabel=elevation ? (miles ? "Altitude (ft)" : "Altitude (m)") : (miles ? "Pace (min/mi)" : "Pace (min/km)");
             String xLabel=miles ? "Distance (mi)" : "Distance (km)";
             textPaint.setTextSize(24f);
+            canvas.drawText(yLabel,left,top+24,textPaint);
             canvas.drawText(xLabel, Math.max(left, right-textPaint.measureText(xLabel)), getHeight()-18, textPaint);
-            canvas.save();
-            canvas.rotate(-90);
-            canvas.drawText(yLabel, -bottom, 26, textPaint);
-            canvas.restore();
 
             if(!elevation){
                 long totalMs=times.get(times.size()-1)-times.get(0);
                 String elapsed=String.format(Locale.US,"Time %02d:%02d:%02d",(totalMs/1000)/3600,((totalMs/1000)%3600)/60,(totalMs/1000)%60);
-                canvas.drawText(elapsed,left,top+24,textPaint);
+                canvas.drawText(elapsed, Math.max(left, right-textPaint.measureText(elapsed)), top+24, textPaint);
             }
         }
 
