@@ -727,7 +727,7 @@ public class MainActivity extends Activity implements SensorEventListener {
     private void captureGoogleMapsSdkLogs() {
         new Thread(() -> {
             try {
-                Process process = Runtime.getRuntime().exec(new String[]{"logcat","-d","-t","300"});
+                java.lang.Process process = Runtime.getRuntime().exec(new String[]{"logcat","-d","-t","300"});
                 BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
                 String line;
                 int captured = 0;
